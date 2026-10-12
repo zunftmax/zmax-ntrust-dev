@@ -1,0 +1,210 @@
+#!/bin/bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+qa=${NTRUST_QA_DIR:-build/boot-check}
+mkdir -p "$qa"
+test ! -e "$qa/root.qcow2"
+qemu-img create -f qcow2 -F qcow2 -b "${NTRUST_QA_IMAGE:-$PWD/dist/qemu/ntrust.qcow2}" "$qa/root.qcow2"
+# Exercise real first-boot partition/filesystem growth on this disposable overlay.
+qemu-img resize "$qa/root.qcow2" 65G
+cp /usr/share/OVMF/OVMF_VARS_4M.fd "$qa/OVMF_VARS.fd"
+python3 - "$qa" <<'PY'
+from pathlib import Path
+import socket
+import sys
+qa = Path(sys.argv[1])
+pubkey = Path('build/image-key.pub').read_text().strip()
+(qa / 'user-data').write_text('''#cloud-config
+users:
+  - name: operator
+    primary_group: users
+    groups: [adm, sudo]
+    shell: /bin/bash
+    sudo: ['ALL=(ALL) NOPASSWD:ALL']
+    ssh_authorized_keys:
+      - ''' + pubkey + '''
+ssh_pwauth: false
+disable_root: true
+write_files:
+  - path: /etc/ntrust/runtime.env
+    permissions: '0644'
+    content: |
+      NTRUST_DOMAIN=inference.example.com
+      NTRUST_EMAIL=admin@example.com
+      NTRUST_ACME_DIRECTORY=https://acme-staging-v02.api.letsencrypt.org/directory
+''')
+(qa / 'meta-data').write_text('instance-id: ntrust-final-image-boot-check\nlocal-hostname: ntrust-check\n')
+with socket.socket() as sock:
+    sock.bind(('127.0.0.1', 0))
+    (qa / 'port').write_text(str(sock.getsockname()[1]))
+PY
+xorriso -as mkisofs -quiet -V cidata -J -r -o "$qa/seed.iso" "$qa/user-data" "$qa/meta-data"
+port=$(cat "$qa/port")
+qemu-system-x86_64 -name ntrust-boot-check -enable-kvm -machine q35 -cpu host -smp 2 -m 4096 \
+  -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
+  -drive if=pflash,format=raw,file="$qa/OVMF_VARS.fd" \
+  -device virtio-scsi-pci,id=scsi0 \
+  -drive if=none,id=root,format=qcow2,file="$qa/root.qcow2",discard=unmap \
+  -device scsi-hd,drive=root,bus=scsi0.0 \
+  -drive if=virtio,format=raw,readonly=on,file="$qa/seed.iso" \
+  -netdev user,id=net0,hostfwd=tcp:127.0.0.1:"$port"-:22 -device virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56 \
+  -display none -serial file:"$qa/serial.log" -daemonize -pidfile "$qa/qemu.pid"
+trap 'test ! -f "$qa/qemu.pid" || kill "$(cat "$qa/qemu.pid")" 2>/dev/null || true' EXIT
+guest_ssh=(ssh -o BatchMode=yes -o ConnectTimeout=2 -o StrictHostKeyChecking=accept-new \
+  -o UserKnownHostsFile="$qa/known-hosts" -i build/image-key -p "$port" operator@127.0.0.1)
+for _attempt in $(seq 1 90); do
+  if "${guest_ssh[@]}" true 2>/dev/null; then break; fi
+  sleep 2
+done
+"${guest_ssh[@]}" 'sudo bash -s' <<'GUEST' | tee "$qa/results.log"
+set -euo pipefail
+cloud-init status --wait
+python3 - <<'PYRESIZE'
+from pathlib import Path
+import re
+import subprocess
+major_minor = subprocess.check_output(['findmnt', '-n', '-o', 'MAJ:MIN', '/'], text=True).strip()
+partition = Path('/sys/dev/block', major_minor).resolve()
+start = int((partition / 'start').read_text()) * 512
+size = int((partition / 'size').read_text()) * 512
+disk_size = int((partition.parent / 'size').read_text()) * 512
+assert disk_size == 65 * 1024**3, disk_size
+assert disk_size - start - size < 1024**2, (start, size, disk_size)
+superblock = subprocess.check_output(['tune2fs', '-l', '/dev/' + partition.name], text=True)
+blocks = int(re.search(r'^Block count:\s+(\d+)$', superblock, re.M).group(1))
+block_size = int(re.search(r'^Block size:\s+(\d+)$', superblock, re.M).group(1))
+assert 0 <= size - blocks * block_size < 1024**2, (size, blocks * block_size)
+print(f'PASS: first-boot partition and filesystem expansion: {size} / {blocks * block_size} bytes')
+PYRESIZE
+uname -r
+test "$(uname -r)" = 7.2.10-ntrust
+systemd-detect-virt
+cvm=$(systemd-detect-virt --cvm || true)
+test "$cvm" = none
+printf 'CPU confidential mode: %s\n' "$cvm"
+test ! -e /proc/swaps
+grep -q '^# CONFIG_SWAP is not set$' "/boot/config-$(uname -r)"
+grep -q '^# CONFIG_COREDUMP is not set$' "/boot/config-$(uname -r)"
+grep -q '^CONFIG_MODULE_SIG_FORCE=y$' "/boot/config-$(uname -r)"
+# Remove only the appended signature from a valid ELF module. Forced signing
+# must reject it even when root requests the load.
+python3 - <<'PYMODULE'
+from pathlib import Path
+import os
+import subprocess
+import tempfile
+module = Path(subprocess.check_output(['modinfo', '-F', 'filename', 'kpp'], text=True).strip())
+data = module.read_bytes()
+magic = b'~Module signature appended~\n'
+assert data.endswith(magic)
+siglen = int.from_bytes(data[-len(magic)-4:-len(magic)], 'big')
+with tempfile.TemporaryDirectory(dir='/run') as directory:
+    unsigned = Path(directory, 'unsigned.ko')
+    unsigned.write_bytes(data[:-(len(magic) + 12 + siglen)])
+    result = subprocess.run(['insmod', str(unsigned)], capture_output=True, text=True,
+                            env={**os.environ, 'LC_ALL': 'C'})
+assert result.returncode != 0, 'Unsigned module loaded'
+assert any(s in result.stderr for s in ('Key was rejected', 'Required key not available')), result.stderr
+print('PASS: root cannot load the unsigned copy of a valid crypto module')
+PYMODULE
+modprobe ecdh_generic
+modprobe ecdsa_generic
+test "$(sshd -T | sed -n 's/^permitrootlogin //p')" = no
+test "$(sshd -T | sed -n 's/^passwordauthentication //p')" = no
+systemd-analyze verify /etc/systemd/system/ntrust-*.service
+modinfo -F version nvidia
+modinfo -F signer nvidia
+test -n "$(modinfo -F signer nvidia)"
+nvattest version
+if /usr/local/lib/ntrust/gpu-ready; then
+  echo 'ERROR: GPU gate admitted ordinary VM' >&2
+  exit 1
+fi
+systemctl start ntrust-inference.service ntrust-https.service && {
+  echo 'ERROR: inference service admitted ordinary VM' >&2
+  exit 1
+}
+for service in ntrust-gpu ntrust-inference ntrust-https; do
+  state=$(systemctl show -p ActiveState --value "$service")
+  printf '%s: %s\n' "$service" "$state"
+  test "$state" != active
+done
+test ! -e /run/ntrust-gpu/api-key
+test ! -e /run/ntrust-gpu/attestation.json
+test -z "$(ss -H -ltn 'sport = :443 or sport = :8080')"
+test "$(systemctl is-enabled nginx.service)" = masked
+test "$(systemctl show -p LoadState --value walinuxagent.service)" = not-found
+for unit in sleep.target suspend.target hibernate.target systemd-pstore.service nvidia-suspend.service cloud-init-hotplugd.socket; do
+  test "$(systemctl is-enabled "$unit")" = masked
+done
+for module in nfsd kvm nvmet_tcp ib_srpt sctp amdgpu openvswitch scsi_debug kafs bluetooth vxlan target_core_iblock idpf vmwgfx ip_vs snd_pcm; do
+  if modprobe "$module"; then echo "ERROR: loaded forbidden module $module" >&2; exit 1; fi
+  test ! -d "/sys/module/${module//-/_}"
+done
+modinfo -F filename gve
+printf 'Kernel configuration for architecture and allocator triage:\n'
+grep -E 'CONFIG_(X86_64|S390|NEED_PER_CPU_KM|NEED_PER_CPU_PAGE_FIRST_CHUNK|NEED_PER_CPU_EMBED_FIRST_CHUNK|MSM_MDP)' "/boot/config-$(uname -r)" || true
+printf 'Root filesystem features:\n'
+tune2fs -l "$(findmnt -n -o SOURCE /)" | sed -n '/Filesystem features:/p'
+for package in walinuxagent ubuntu-pro-client pollinate lxd-installer ubuntu-drivers-common linux-firmware \
+    initramfs-tools initramfs-tools-core busybox-initramfs klibc-utils libklibc cpio; do
+  test "$(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null || true)" != installed
+done
+/usr/local/bin/ntrust-status
+printf 'PASS: unwanted packages absent; sleep/pstore disabled; optional subsystems reject module loads.\n'
+
+systemctl show -p ActiveState -p SubState systemd-timesyncd.service
+printf 'Running OS services in this ordinary VM:\n'
+systemctl list-units --type=service --state=running --no-legend --no-pager
+ss -ltn
+df -B1 /
+printf 'PASS: completed image boots; ordinary VM rejected; no inference listener or API key.\n'
+# Test the shipped inference network policy with public synthetic data.
+# No GPU gate is bypassed and no inference process is started.
+fixture=$(mktemp -d /run/ntrust-network-check.XXXXXX)
+printf 'network-check\n' > "$fixture/index.html"
+python3 -m http.server 18081 --bind 0.0.0.0 --directory "$fixture" >/dev/null 2>&1 &
+fixture_pid=$!
+trap 'kill "$fixture_pid" 2>/dev/null || true; rm -rf "$fixture"' EXIT
+for _ in $(seq 1 20); do
+  if curl --noproxy '*' --fail --silent --max-time 1 -o /dev/null http://127.0.0.1:18081/; then break; fi
+  sleep 1
+done
+guest_ip=$(ip -4 -o addr show scope global | awk 'NR==1 {sub(/\/.*/, "", $4); print $4}')
+test -n "$guest_ip"
+curl --noproxy '*' --fail --silent --max-time 2 -o /dev/null "http://$guest_ip:18081/"
+policy=(--property=User=ntrust
+  --property="IPAddressDeny=$(systemctl show -p IPAddressDeny --value ntrust-inference.service)"
+  --property="IPAddressAllow=$(systemctl show -p IPAddressAllow --value ntrust-inference.service)")
+systemd-run --quiet --wait --pipe --collect "${policy[@]}" \
+  curl --noproxy '*' --fail --silent --max-time 3 -o /dev/null http://127.0.0.1:18081/
+if systemd-run --quiet --wait --pipe --collect "${policy[@]}" \
+  curl --noproxy '*' --fail --silent --max-time 3 -o /dev/null "http://$guest_ip:18081/"; then
+  echo 'ERROR: inference policy allowed a non-loopback destination' >&2
+  exit 1
+fi
+kill "$fixture_pid"
+wait "$fixture_pid" 2>/dev/null || true
+rm -rf "$fixture"
+trap - EXIT
+printf 'PASS: actual inference IP policy permits loopback and denies a reachable non-loopback destination.\n'
+GUEST
+"${guest_ssh[@]}" 'sudo /opt/ntrust/venv/bin/python -' < image/check-engine.py | tee "$qa/engine-parser.log"
+"${guest_ssh[@]}" 'sudo systemd-run --quiet --wait --pipe --collect --property=User=ntrust --property=MemoryMax=96M --property=TasksMax=16 --property=RuntimeDirectory=ntrust-lock-check --property=RuntimeDirectoryMode=0700 /usr/bin/python3 -' < tests/check-file-lock-accounting.py | tee "$qa/file-lock-accounting.log"
+previous_boot=$("${guest_ssh[@]}" cat /proc/sys/kernel/random/boot_id)
+"${guest_ssh[@]}" sudo reboot || true
+for _attempt in $(seq 1 90); do
+  current_boot=$("${guest_ssh[@]}" cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)
+  if [ -n "$current_boot" ] && [ "$current_boot" != "$previous_boot" ]; then break; fi
+  sleep 2
+done
+test -n "$current_boot" && test "$current_boot" != "$previous_boot"
+"${guest_ssh[@]}" 'sudo bash -s' <<'REBOOT' | tee "$qa/reboot.log"
+set -euo pipefail
+cloud-init status --wait
+test "$(uname -r)" = 7.2.10-ntrust
+test ! -e /run/ntrust-gpu/api-key
+test -z "$(ss -H -ltn 'sport = :443 or sport = :8080')"
+printf 'PASS: the same VM reboots, provisions networking and continues to reject ordinary-VM inference.\n'
+REBOOT
+"${guest_ssh[@]}" sudo poweroff || true
