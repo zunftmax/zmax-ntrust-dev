@@ -16,6 +16,13 @@ elif ! grep -qx '# CONFIG_SWAP is not set' "/boot/config-$(uname -r)"; then
     echo 'Cannot establish that swap is compiled out.' >&2
     exit 1
 fi
+
+# Confidential production zero-operator mode: disable remote administration attack surface.
+if command -v systemctl >/dev/null 2>&1; then
+    if [ "${NTRUST_NO_SSH:-0}" = "1" ] || [ "${NTRUST_OPERATOR_ACCESS:-1}" = "0" ]; then
+        systemctl mask --now ssh.service ssh.socket 2>/dev/null || true
+    fi
+fi
 if ! command -v nvidia-smi >/dev/null 2>&1; then
     # Development image: no GPU stack installed, so boot the CPU tryout path.
     # This exercises cloud-init, TLS issuance and the inference API without
